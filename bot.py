@@ -7,6 +7,7 @@
 import json
 import os
 import random
+import asyncio
 import aiohttp
 import uuid
 import ssl
@@ -29,6 +30,9 @@ SESSIONS_FILE = "sessions.json"
 # GigaChat API URLs
 GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 GIGACHAT_API_URL = "https://gigachat.devices.sberbank.ru/api/v1"
+
+# Пауза между генерациями картинок (секунды)
+IMAGE_DELAY = 30
 
 # Состояния диалога
 WAITING_CODE = 0
@@ -157,7 +161,7 @@ async def get_gigachat_token():
 
 
 async def gigachat_request(messages, max_retries=2):
-    """Отправить запрос к GigaChat"""
+    """Отправить запрос к GigaChat Lite (для текста)"""
     for attempt in range(max_retries):
         token = await get_gigachat_token()
         if not token:
@@ -168,7 +172,8 @@ async def gigachat_request(messages, max_retries=2):
         ssl_context.verify_mode = ssl.CERT_NONE
         
         try:
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{GIGACHAT_API_URL}/chat/completions",
                     headers={
@@ -177,7 +182,7 @@ async def gigachat_request(messages, max_retries=2):
                         "Authorization": f"Bearer {token}"
                     },
                     json={
-                        "model": "GigaChat",
+                        "model": "GigaChat",  # Lite для текста (экономим токены)
                         "messages": messages,
                         "temperature": 0.9
                     },
@@ -186,6 +191,10 @@ async def gigachat_request(messages, max_retries=2):
                     if resp.status == 200:
                         data = await resp.json()
                         return data["choices"][0]["message"]["content"]
+                    else:
+                        print(f"GigaChat API error: {resp.status}")
+        except asyncio.TimeoutError:
+            print(f"GigaChat timeout (attempt {attempt + 1})")
         except Exception as e:
             print(f"GigaChat request error (attempt {attempt + 1}): {e}")
     
@@ -193,7 +202,7 @@ async def gigachat_request(messages, max_retries=2):
 
 
 async def gigachat_generate_image(prompt, max_retries=2):
-    """Сгенерировать изображение через GigaChat (Kandinsky)"""
+    """Сгенерировать изображение через GigaChat Max (Kandinsky)"""
     for attempt in range(max_retries):
         token = await get_gigachat_token()
         if not token:
@@ -204,7 +213,8 @@ async def gigachat_generate_image(prompt, max_retries=2):
         ssl_context.verify_mode = ssl.CERT_NONE
         
         try:
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=90)  # 90 секунд для картинок
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{GIGACHAT_API_URL}/chat/completions",
                     headers={
@@ -213,21 +223,25 @@ async def gigachat_generate_image(prompt, max_retries=2):
                         "Authorization": f"Bearer {token}"
                     },
                     json={
-                        "model": "GigaChat",
+                        "model": "GigaChat-Max",  # Max для картинок
                         "messages": [{"role": "user", "content": prompt}],
                         "function_call": "auto"
                     },
                     ssl=ssl_context
                 ) as resp:
                     if resp.status != 200:
+                        error_text = await resp.text()
+                        print(f"GigaChat image API error: {resp.status} - {error_text[:200]}")
                         continue
                     data = await resp.json()
                     content = data["choices"][0]["message"]["content"]
+                    print(f"GigaChat image response: {content[:200]}")
                     
                     if "<img src=\"" in content:
                         start = content.find("<img src=\"") + 10
                         end = content.find("\"", start)
                         file_id = content[start:end]
+                        print(f"Downloading image: {file_id}")
                         
                         async with session.get(
                             f"{GIGACHAT_API_URL}/files/{file_id}/content",
@@ -236,6 +250,12 @@ async def gigachat_generate_image(prompt, max_retries=2):
                         ) as img_resp:
                             if img_resp.status == 200:
                                 return await img_resp.read()
+                            else:
+                                print(f"Image download error: {img_resp.status}")
+                    else:
+                        print("No image tag in response")
+        except asyncio.TimeoutError:
+            print(f"GigaChat image timeout (attempt {attempt + 1})")
         except Exception as e:
             print(f"GigaChat image error (attempt {attempt + 1}): {e}")
     
@@ -291,16 +311,21 @@ async def generate_birthday_card(name, gender):
 
 
 async def generate_ai_greeting(name):
-    """Полная генерация: пол + поздравление + 2 открытки"""
+    """Полная генерация: пол + поздравление + 2 открытки с паузой"""
     gender = await detect_gender(name)
     greeting = await generate_greeting(name)
     
-    card1 = await generate_birthday_card(name, gender)
-    card2 = await generate_birthday_card(name, gender)
+    cards = []
+    for i in range(2):
+        if i > 0:
+            print(f"Пауза {IMAGE_DELAY} сек перед открыткой {i + 1}...")
+            await asyncio.sleep(IMAGE_DELAY)
+        card = await generate_birthday_card(name, gender)
+        cards.append(card)
     
     return {
         "greeting": greeting,
-        "cards": [card1, card2],
+        "cards": cards,
         "gender": gender
     }
 
@@ -499,37 +524,57 @@ async def test_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(f"🔄 Генерирую поздравление для: {name}\nПодожди немного...")
     
-    result = await generate_ai_greeting(name)
-    
-    if result["greeting"]:
-        gender_text = "👩 Женщина" if result["gender"] == "f" else "👨 Мужчина"
-        await update.message.reply_text(
-            f"🎂 *Поздравление для {name}*\n"
-            f"({gender_text})\n\n"
-            f"{result['greeting']}",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            f"⚠️ Не удалось сгенерировать текст.\n"
-            f"Простое поздравление:\n\n"
-            f"🎉 {name}, с днём рождения! Счастья, здоровья и всех благ! 🎂"
-        )
-    
-    cards_sent = 0
-    for i, card_data in enumerate(result["cards"]):
-        if card_data:
+    try:
+        # Определяем пол
+        await update.message.reply_text("1️⃣ Определяю пол...")
+        gender = await detect_gender(name)
+        gender_text = "👩 Женщина" if gender == "f" else "👨 Мужчина"
+        await update.message.reply_text(f"Пол: {gender_text}")
+        
+        # Генерируем текст
+        await update.message.reply_text("2️⃣ Генерирую поздравление...")
+        greeting = await generate_greeting(name)
+        
+        if greeting:
+            await update.message.reply_text(
+                f"🎂 *Поздравление для {name}*\n\n{greeting}",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"⚠️ Текст не сгенерирован.\n\n"
+                f"🎉 {name}, с днём рождения! Счастья, здоровья и всех благ! 🎂"
+            )
+        
+        # Генерируем открытки с паузой
+        await update.message.reply_text("3️⃣ Генерирую открытки (это может занять время)...")
+        
+        cards_sent = 0
+        for i in range(2):
+            if i > 0:
+                await update.message.reply_text(f"   ⏳ Пауза {IMAGE_DELAY} сек перед второй открыткой...")
+                await asyncio.sleep(IMAGE_DELAY)
             try:
-                await update.message.reply_photo(
-                    photo=BytesIO(card_data),
-                    caption=f"Открытка {i + 1}"
-                )
-                cards_sent += 1
+                await update.message.reply_text(f"   🎨 Открытка {i + 1}...")
+                card_data = await generate_birthday_card(name, gender)
+                if card_data:
+                    await update.message.reply_photo(
+                        photo=BytesIO(card_data),
+                        caption=f"Открытка {i + 1}"
+                    )
+                    cards_sent += 1
+                else:
+                    await update.message.reply_text(f"   ❌ Открытка {i + 1} не сгенерирована")
             except Exception as e:
-                print(f"Ошибка отправки открытки: {e}")
-    
-    if cards_sent == 0:
-        await update.message.reply_text("⚠️ Не удалось сгенерировать открытки.")
+                await update.message.reply_text(f"   ❌ Ошибка открытки {i + 1}: {str(e)[:100]}")
+        
+        if cards_sent == 0:
+            await update.message.reply_text("⚠️ Открытки не удалось сгенерировать.")
+        
+        await update.message.reply_text("✅ Тест завершён!")
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {str(e)[:200]}")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -569,28 +614,35 @@ async def daily_birthday_check(app):
             for birthday in today_bdays:
                 name = birthday["name"]
                 
-                result = await generate_ai_greeting(name)
+                # Генерируем поздравление
+                gender = await detect_gender(name)
+                greeting = await generate_greeting(name)
                 
-                if result["greeting"]:
+                if greeting:
                     try:
                         await app.bot.send_message(
                             chat_id=int(chat_id),
-                            text=f"🎂 *Сегодня день рождения: {name}*\n\n{result['greeting']}",
+                            text=f"🎂 *Сегодня день рождения: {name}*\n\n{greeting}",
                             parse_mode="Markdown"
                         )
                     except Exception as e:
                         print(f"Ошибка отправки текста {chat_id}: {e}")
                     
-                    for i, card_data in enumerate(result["cards"]):
-                        if card_data:
-                            try:
+                    # Генерируем 2 открытки с паузой
+                    for i in range(2):
+                        if i > 0:
+                            print(f"Пауза {IMAGE_DELAY} сек перед открыткой {i + 1}...")
+                            await asyncio.sleep(IMAGE_DELAY)
+                        try:
+                            card_data = await generate_birthday_card(name, gender)
+                            if card_data:
                                 await app.bot.send_photo(
                                     chat_id=int(chat_id),
                                     photo=BytesIO(card_data),
                                     caption=f"Открытка {i + 1} для {name}"
                                 )
-                            except Exception as e:
-                                print(f"Ошибка отправки открытки {chat_id}: {e}")
+                        except Exception as e:
+                            print(f"Ошибка отправки открытки {chat_id}: {e}")
                 else:
                     try:
                         await app.bot.send_message(
@@ -680,6 +732,7 @@ def main():
     print(f"Пользователей: {len(USERS)}")
     print(f"Активных сессий: {len(sessions)}")
     print(f"GigaChat: {'✓ настроен' if GIGACHAT_AUTH else '✗ не настроен'}")
+    print(f"Пауза между картинками: {IMAGE_DELAY} сек")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
